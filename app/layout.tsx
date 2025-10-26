@@ -10,7 +10,6 @@ const _geistMono = Geist_Mono({ subsets: ["latin"] })
 export const metadata: Metadata = {
   title: "Focus Flow - Pomodoro & Kanban",
   description: "Stay focused and organized with Pomodoro timer and Kanban board",
-  generator: "v0.app",
 }
 
 export default function RootLayout({
@@ -20,6 +19,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <link rel="icon" href="/favicon.ico" sizes="any" />
       <body className={`font-sans antialiased`}>
         {children}
         <Analytics />

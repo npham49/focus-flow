@@ -14,67 +14,183 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog"
+import { subscribeUser, unsubscribeUser, sendNotification } from "@/app/actions"
 
 interface TimerSettings {
   workDuration: number
   breakDuration: number
 }
 
+interface TimerState {
+  settings: TimerSettings
+  setSettings: (settings: TimerSettings) => void
+  isWork: boolean
+  setIsWork: (isWork: boolean) => void
+  timeLeft: number
+  setTimeLeft: (timeLeft: number | ((prev: number) => number)) => void
+  isRunning: boolean
+  setIsRunning: (isRunning: boolean) => void
+  notificationsEnabled: boolean
+  setNotificationsEnabled: (enabled: boolean) => void
+  subscription: PushSubscription | null
+  setSubscription: (sub: PushSubscription | null) => void
+  hasInitialized: React.MutableRefObject<boolean>
+}
+
+// Utility function to convert base64 to Uint8Array for VAPID key
+function urlBase64ToUint8Array(base64String: string) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4)
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/')
+
+  const rawData = window.atob(base64)
+  const outputArray = new Uint8Array(rawData.length)
+
+  for (let i = 0; i < rawData.length; ++i) {
+    outputArray[i] = rawData.charCodeAt(i)
+  }
+  return outputArray
+}
+
 export function PomodoroTimer({
   viewMode = "full",
   onViewModeChange,
-}: { viewMode?: "full" | "compact"; onViewModeChange?: (mode: "full" | "compact") => void }) {
-  const [settings, setSettings] = useState<TimerSettings>(() => {
+  timerState,
+}: {
+  viewMode?: "full" | "compact"
+  onViewModeChange?: (mode: "full" | "compact") => void
+  timerState?: TimerState
+}) {
+  // Use passed timerState if available, otherwise use local state (for backwards compatibility)
+  const localSettings = useState<TimerSettings>({ workDuration: 25, breakDuration: 5 })
+  const localIsWork = useState(true)
+  const localTimeLeft = useState(25 * 60)
+  const localIsRunning = useState(false)
+  const localNotificationsEnabled = useState(false)
+  const localSubscription = useState<PushSubscription | null>(null)
+  const localHasInitialized = useRef(false)
+
+  const settings = timerState?.settings ?? localSettings[0]
+  const setSettings = timerState?.setSettings ?? localSettings[1]
+  const isWork = timerState?.isWork ?? localIsWork[0]
+  const setIsWork = timerState?.setIsWork ?? localIsWork[1]
+  const timeLeft = timerState?.timeLeft ?? localTimeLeft[0]
+  const setTimeLeft = timerState?.setTimeLeft ?? localTimeLeft[1]
+  const isRunning = timerState?.isRunning ?? localIsRunning[0]
+  const setIsRunning = timerState?.setIsRunning ?? localIsRunning[1]
+  const notificationsEnabled = timerState?.notificationsEnabled ?? localNotificationsEnabled[0]
+  const setNotificationsEnabled = timerState?.setNotificationsEnabled ?? localNotificationsEnabled[1]
+  const subscription = timerState?.subscription ?? localSubscription[0]
+  const setSubscription = timerState?.setSubscription ?? localSubscription[1]
+  const hasInitialized = timerState?.hasInitialized ?? localHasInitialized
+
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [isClient, setIsClient] = useState(false)
+  const audioContextRef = useRef<AudioContext | null>(null)
+
+  // Load settings from localStorage after mount (client-side only) - only if not using shared state
+  useEffect(() => {
+    if (timerState) return // Skip if using shared state
+
+    setIsClient(true)
     if (typeof window !== "undefined") {
       const saved = localStorage.getItem("pomodoroSettings")
-      return saved ? JSON.parse(saved) : { workDuration: 25, breakDuration: 5 }
+      if (saved) {
+        const savedSettings = JSON.parse(saved)
+        setSettings(savedSettings)
+        if (!hasInitialized.current) {
+          setTimeLeft(savedSettings.workDuration * 60)
+          hasInitialized.current = true
+        }
+      } else {
+        hasInitialized.current = true
+      }
     }
-    return { workDuration: 25, breakDuration: 5 }
-  })
-
-  const [isWork, setIsWork] = useState(true)
-  const [timeLeft, setTimeLeft] = useState(settings.workDuration * 60)
-  const [isRunning, setIsRunning] = useState(false)
-  const [dialogOpen, setDialogOpen] = useState(false)
-  const [notificationsEnabled, setNotificationsEnabled] = useState(false)
-  const audioContextRef = useRef<AudioContext | null>(null)
+  }, [timerState])
 
   useEffect(() => {
     if (typeof window !== "undefined") {
       audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)()
-      if (Notification.permission === "granted") {
-        setNotificationsEnabled(true)
+
+      // Register service worker and check subscription status
+      if ('serviceWorker' in navigator && 'PushManager' in window) {
+        registerServiceWorker()
       }
     }
   }, [])
 
+  async function registerServiceWorker() {
+    try {
+      const registration = await navigator.serviceWorker.register('/sw.js', {
+        scope: '/',
+        updateViaCache: 'none',
+      })
+      const sub = await registration.pushManager.getSubscription()
+      setSubscription(sub)
+      setNotificationsEnabled(sub !== null && Notification.permission === 'granted')
+    } catch (error) {
+      console.error('Error registering service worker:', error)
+    }
+  }
+
   const requestNotificationPermission = async () => {
-    if (!("Notification" in window)) {
-      console.log("[v0] Notifications not supported")
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      console.log('Push notifications not supported')
       return
     }
 
     try {
       const permission = await Notification.requestPermission()
-      setNotificationsEnabled(permission === "granted")
+
+      if (permission === 'granted') {
+        await subscribeToPush()
+      } else {
+        setNotificationsEnabled(false)
+      }
     } catch (error) {
-      console.error("[v0] Error requesting notification permission:", error)
+      console.error('Error requesting notification permission:', error)
     }
   }
 
-  const sendNotification = (title: string, body: string) => {
-    if (!notificationsEnabled || Notification.permission !== "granted") return
+  async function subscribeToPush() {
+    try {
+      const registration = await navigator.serviceWorker.ready
+      const sub = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(
+          process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY!
+        ),
+      })
+      setSubscription(sub)
+      const serializedSub = JSON.parse(JSON.stringify(sub))
+      await subscribeUser(serializedSub)
+      setNotificationsEnabled(true)
+    } catch (error) {
+      console.error('Error subscribing to push:', error)
+      setNotificationsEnabled(false)
+    }
+  }
+
+  async function unsubscribeFromPush() {
+    try {
+      await subscription?.unsubscribe()
+      setSubscription(null)
+      await unsubscribeUser()
+      setNotificationsEnabled(false)
+    } catch (error) {
+      console.error('Error unsubscribing:', error)
+    }
+  }
+
+  const sendPushNotification = async (message: string) => {
+    if (!notificationsEnabled || !subscription) {
+      console.log('Notifications not enabled or no subscription')
+      return
+    }
 
     try {
-      new Notification(title, {
-        body,
-        icon: "/favicon.ico",
-        badge: "/favicon.ico",
-        tag: "pomodoro-timer",
-        requireInteraction: false,
-      })
+      await sendNotification(message)
     } catch (error) {
-      console.error("[v0] Error sending notification:", error)
+      console.error('Error sending notification:', error)
     }
   }
 
@@ -98,16 +214,7 @@ export function PomodoroTimer({
     oscillator.stop(ctx.currentTime + 0.5)
   }
 
-  useEffect(() => {
-    if (typeof window !== "undefined") {
-      localStorage.setItem("pomodoroSettings", JSON.stringify(settings))
-    }
-  }, [settings])
-
-  useEffect(() => {
-    setTimeLeft(isWork ? settings.workDuration * 60 : settings.breakDuration * 60)
-  }, [isWork, settings])
-
+  // Main timer countdown effect
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null
 
@@ -118,18 +225,19 @@ export function PomodoroTimer({
     } else if (timeLeft === 0 && isRunning) {
       playNotificationSound()
       if (isWork) {
-        sendNotification("Work Session Complete! 🎉", "Time for a break. Great job!")
+        sendPushNotification("Work Session Complete! 🎉 Time for a break. Great job!")
+        setTimeLeft(settings.breakDuration * 60)
       } else {
-        sendNotification("Break Time Over! 💪", "Ready to get back to work?")
+        sendPushNotification("Break Time Over! 💪 Ready to get back to work?")
+        setTimeLeft(settings.workDuration * 60)
       }
       setIsWork(!isWork)
-      console.log("isWork", isWork)
     }
 
     return () => {
       if (interval) clearInterval(interval)
     }
-  }, [isRunning, timeLeft])
+  }, [isRunning, timeLeft, isWork, settings.workDuration, settings.breakDuration])
 
   const toggleTimer = () => {
     setIsRunning(!isRunning)
@@ -156,9 +264,8 @@ export function PomodoroTimer({
   if (viewMode === "compact") {
     return (
       <div
-        className={`w-full transition-colors duration-500 border-b ${
-          isWork ? "bg-blue-950/30 border-blue-800/50" : "bg-emerald-950/30 border-emerald-800/50"
-        }`}
+        className={`w-full transition-colors duration-500 border-b ${isWork ? "bg-blue-950/30 border-blue-800/50" : "bg-emerald-950/30 border-emerald-800/50"
+          }`}
       >
         <div className="container mx-auto px-4 py-3">
           <div className="flex items-center gap-4">
@@ -191,8 +298,8 @@ export function PomodoroTimer({
                 variant="ghost"
                 size="sm"
                 className="h-8 w-8 p-0"
-                onClick={requestNotificationPermission}
-                title={notificationsEnabled ? "Notifications enabled" : "Enable notifications"}
+                onClick={notificationsEnabled ? unsubscribeFromPush : requestNotificationPermission}
+                title={notificationsEnabled ? "Disable notifications" : "Enable notifications"}
               >
                 {notificationsEnabled ? (
                   <Bell className="h-4 w-4 text-green-500" />
@@ -235,9 +342,8 @@ export function PomodoroTimer({
   return (
     <>
       <Card
-        className={`transition-colors duration-500 ${
-          isWork ? "bg-blue-950/30 border-blue-800/50" : "bg-emerald-950/30 border-emerald-800/50"
-        }`}
+        className={`transition-colors duration-500 ${isWork ? "bg-blue-950/30 border-blue-800/50" : "bg-emerald-950/30 border-emerald-800/50"
+          }`}
       >
         <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-4">
           <CardTitle className="text-lg font-medium flex items-center gap-2">
@@ -249,8 +355,8 @@ export function PomodoroTimer({
               variant="ghost"
               size="icon"
               className="h-8 w-8"
-              onClick={requestNotificationPermission}
-              title={notificationsEnabled ? "Notifications enabled" : "Enable notifications"}
+              onClick={notificationsEnabled ? unsubscribeFromPush : requestNotificationPermission}
+              title={notificationsEnabled ? "Disable notifications" : "Enable notifications"}
             >
               {notificationsEnabled ? (
                 <Bell className="h-4 w-4 text-green-500" />
