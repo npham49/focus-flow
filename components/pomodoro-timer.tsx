@@ -85,7 +85,6 @@ export function PomodoroTimer({
 
   const [dialogOpen, setDialogOpen] = useState(false)
   const [isClient, setIsClient] = useState(false)
-  const audioContextRef = useRef<AudioContext | null>(null)
 
   // Load settings from localStorage after mount (client-side only) - only if not using shared state
   useEffect(() => {
@@ -109,8 +108,6 @@ export function PomodoroTimer({
 
   useEffect(() => {
     if (typeof window !== "undefined") {
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)()
-
       // Register service worker and check subscription status
       if ('serviceWorker' in navigator && 'PushManager' in window) {
         registerServiceWorker()
@@ -195,23 +192,11 @@ export function PomodoroTimer({
   }
 
   const playNotificationSound = () => {
-    if (!audioContextRef.current) return
-
-    const ctx = audioContextRef.current
-    const oscillator = ctx.createOscillator()
-    const gainNode = ctx.createGain()
-
-    oscillator.connect(gainNode)
-    gainNode.connect(ctx.destination)
-
-    oscillator.frequency.value = 800
-    oscillator.type = "sine"
-
-    gainNode.gain.setValueAtTime(0.3, ctx.currentTime)
-    gainNode.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5)
-
-    oscillator.start(ctx.currentTime)
-    oscillator.stop(ctx.currentTime + 0.5)
+    const audio = new Audio('/complete.mp3')
+    audio.volume = 0.85
+    audio.play().catch(error => {
+      console.error('Error playing notification sound:', error)
+    })
   }
 
   // Main timer countdown effect
